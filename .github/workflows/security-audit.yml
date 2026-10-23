@@ -1,0 +1,135 @@
+name: Security Audit
+
+# 各リポジトリから呼ぶ、週次のセキュリティ点検。呼び出し側の書き方は README を参照
+on:
+  workflow_call:
+    inputs:
+      lockfile:
+        description: OSV-Scanner で調べるロックファイルのパス（リポジトリのルートから）
+        type: string
+        default: pnpm-lock.yaml
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+# ジョブごとに必要な権限だけを与えるため、既定ではすべて無効にする
+permissions: {}
+
+jobs:
+  # 変更のない週に同じ指摘の Issue を作らないよう、定期実行では直前 7 日間にコミットがあるときだけ点検する。
+  # 依存パッケージの新しい脆弱性はコミットと関係なく見つかるため、Dependabot alerts で別に通知を受ける
+  check-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      should-audit: ${{ steps.check.outputs.should-audit }}
+    steps:
+      - name: Check recent commits
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should-audit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          count=$(gh api "repos/$REPO/commits?sha=$BRANCH&since=$since&per_page=1" --jq 'length')
+          if [ "$count" -gt 0 ]; then
+            echo "should-audit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-audit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Claude が動くジョブには読み取り権限しか与えない。
+  # リポジトリ内の文章によるプロンプトインジェクションが起きても、書き込みや push ができないようにする
+  audit:
+    needs: check-changes
+    if: needs.check-changes.outputs.should-audit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 点検スキルは各リポジトリにコピーせず、このリポジトリのものを毎回読み込む
+      - name: Checkout security-workflows
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kikeda1102/security-workflows
+          path: .security-workflows
+          persist-credentials: false
+
+      - name: Install audit skill
+        run: |
+          mkdir -p .claude/skills
+          rm -rf .claude/skills/security-audit
+          cp -R .security-workflows/skills/security-audit .claude/skills/security-audit
+          rm -rf .security-workflows
+
+      # パッケージのインストールは postinstall などのスクリプトを実行するため行わない。
+      # ロックファイルだけで既知の脆弱性を調べ、結果を Claude に読ませる。
+      # 脆弱性が見つかると終了コードが 0 以外になるが、結果は Claude が読むので止めない
+      - name: Check dependencies
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output-file=osv-results.json
+            --lockfile=${{ inputs.lockfile }}
+
+      - name: Run security audit
+        uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967 # v1.0.252
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # 渡さないと Claude GitHub App のトークンが使われ、上の permissions で権限を絞れない
+          github_token: ${{ github.token }}
+          prompt: /security-audit security-report.md
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 80
+            --allowedTools "Read,Glob,Grep,Write"
+            --disallowedTools "Bash,WebFetch,WebSearch"
+
+      - name: Upload report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-report
+          path: security-report.md
+          if-no-files-found: error
+          retention-days: 30
+
+  # Issue を作る権限は、Claude が動かないこのジョブだけに与える
+  report:
+    needs: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Download report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: security-report
+
+      # Issue 本文の上限（65,536 文字）を超えないように切り詰める。
+      # バイト単位で切ると日本語の途中で切れるため、壊れた末尾の文字を iconv で取り除く
+      - name: Create issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          head -c 60000 security-report.md | iconv -f UTF-8 -t UTF-8 -c > issue-body.md
+          gh issue create \
+            --title "セキュリティ定期点検 $(TZ=Asia/Tokyo date +%Y-%m-%d)" \
+            --body-file issue-body.md
