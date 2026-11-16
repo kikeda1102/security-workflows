@@ -80,7 +80,7 @@ jobs:
       # ロックファイルだけで既知の脆弱性を調べ、結果を Claude に読ませる。
       # 脆弱性が見つかると終了コードが 0 以外になるが、結果は Claude が読むので止めない
       - name: Check dependencies
-        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
         continue-on-error: true
         with:
           scan-args: |-
@@ -89,7 +89,7 @@ jobs:
             --lockfile=${{ inputs.lockfile }}
 
       - name: Run security audit
-        uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967 # v1.0.252
+        uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # 渡さないと Claude GitHub App のトークンが使われ、上の permissions で権限を絞れない
